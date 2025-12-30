@@ -1,0 +1,40 @@
+[
+  {
+    "type": "lxc", 
+    "vmid": 888,
+    "hostname": "jellyfin",
+    "template": "local:vztmpl/EXISTING",
+    "memory": 8192,
+    "cores": 8,
+    "state": "running"
+  },
+  {
+    "type": "lxc", 
+    "vmid": 999,
+    "hostname": "plex-pve",
+    "template": "local:vztmpl/EXISTING",
+    "memory": 8192,
+    "cores": 8,
+    "state": "running"
+  },
+  {
+    "type": "lxc", 
+    "vmid": 1000,
+    "hostname": "cloudflare",
+    "template": "local:vztmpl/EXISTING",
+    "memory": 1024,
+    "cores": 2,
+    "state": "running"
+  },
+  {
+    "type": "vm",
+    "vmid": 777,
+    "hostname": "debian-management",
+    "template": "local:iso/EXISTING",
+    "memory": 8192,
+    "cores": 2,
+    "net0": "virtio=BC:24:11:CD:3F:0F,bridge=vmbr0,firewall=1",
+    "storage": "local-lvm:vm-777-disk-0,iothread=1,size=64G",
+    "state": "running"
+  }
+]
