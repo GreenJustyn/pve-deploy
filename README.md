@@ -4,6 +4,24 @@ This repository contains a lightweight, bash-based Infrastructure as Code (IaC) 
 
 The solution is designed to be **self-healing**, **idempotent**, and **safe**, operating on a strict "GitOps" workflow.
 
+🚀 Capabilities
+1. Desired State Configuration (IaC)
+Unified Management: Controls Virtual Machines (QEMU) and Containers (LXC) from a single state.json manifest.
+Drift Detection: Automatically corrects configuration drift (RAM, Cores, Hostname) and enforces Power State.
+Foreign Workload Protection: Blocks deployment if "Unmanaged" resources are detected on the host, preventing accidental overlaps.
+
+2. Automated Host Maintenance
+OS Updates: Automatically performs apt-get update and dist-upgrade for Proxmox VE.
+Safe Reboots: Performs a verbose reboot after updates to ensure the latest kernel is active.
+Loop Prevention: Scheduled strictly via Calendar time to prevent reboot loops.
+
+3. Automated LXC Patching
+Universal Updater: Detects the OS of every LXC container (Debian, Ubuntu, Alpine, Fedora, Arch, etc.) and runs the appropriate package manager update commands.
+Smart State Handling:
+Running Containers: Updated live.
+Stopped Containers: Temporarily started, updated, and shut down again.
+Reboot Audit: Logs which containers require a reboot after patching.
+
 ## 🚀 Key Features
 
 * **Unified Management:** Manages both LXC Containers (`pct`) and Virtual Machines (`qm`) from a single JSON state file.
@@ -11,6 +29,17 @@ The solution is designed to be **self-healing**, **idempotent**, and **safe**, o
 * **Drift Detection:** Automatically corrects configuration drift (e.g., RAM, Cores, Hostname) and enforces Power State (Running/Stopped).
 * **Foreign Workload Protection:** Scans the host for "Unmanaged" resources. If a Foreign VM/LXC is detected, **deployment is blocked** to prevent accidental overlaps, and a JSON snippet is generated for easy adoption.
 * **GitOps Workflow:** The host automatically updates itself from this git repository before every run.
+
+---
+
+** 📅 Automation Schedule
+The system runs on three independent Systemd timers to ensure separation of duties:
+
+| **Service** | **Schedule** | **Description** |
+| --- | --- | --- |
+| **IaC Reconciliation** | **Every 2 Minutes** | Pulls git changes, validates `state.json`, and enforces VM/LXC configuration. |
+| **LXC Auto-Update** | **Sundays @ 01:00** | Patches all LXC containers found on the host. |
+| **Host Auto-Update** | **Sundays @ 04:00** | Updates Proxmox VE host packages and performs a system reboot. |
 
 ---
 
@@ -148,45 +177,25 @@ Plaintext
 
 * * * * *
 
-📂 File Structure
------------------
+## 📂 Repository Structure
+-----------------------
 
--   `setup.sh`: The installer. idempotent. Can be run repeatedly to update the installation.
+| **File** | **Description** |
+| --- | --- |
+| `setup.sh` | The installer. Deploys everything. |
+| `state.json` | The Infrastructure Manifest. |
+| `proxmox_dsc.sh` | The Core IaC Engine (Logic for `pct` and `qm`). |
+| `proxmox_autoupdate.sh` | Host OS Update & Reboot script. |
+| `proxmox_lxc_autoupdate.sh` | LXC Container Patching script. |
 
--   `proxmox_dsc.sh`: The core logic engine. Handles the `pct` and `qm` commands and reconciliation logic.
-
--   `state.json`: The source of truth for your infrastructure.
-
--   (Generated) `proxmox_wrapper.sh`: Created by setup.sh. Handles the git-update and dry-run logic before calling the DSC engine.
-
-📊 Logging & Troubleshooting
+## 📊 Logging & Troubleshooting
 ----------------------------
 
--   **Application Logs:**
+All logs are rotated daily and kept for 7 days.
 
-    Bash
-
-    ```
-    tail -f /var/log/proxmox_dsc.log
-
-    ```
-
--   **Systemd Status:**
-
-    Bash
-
-    ```
-    systemctl status proxmox-iac.timer
-    systemctl status proxmox-iac.service
-
-    ```
-
--   **System Journal (Debug):**
-
-    Bash
-
-    ```
-    journalctl -u proxmox-iac.service -f
-    ```
-
+| **Component** | **Log Location** | **Systemd Status** |
+| --- | --- | --- |
+| **IaC Engine** | `/var/log/proxmox_dsc.log` | `systemctl status proxmox-iac.timer` |
+| **Host Update** | `/var/log/proxmox_autoupdate.log` | `systemctl status proxmox-autoupdate.timer` |
+| **LXC Update** | `/var/log/proxmox_lxc_autoupdate.log` | `systemctl status proxmox-lxc-autoupdate.timer` |
 
