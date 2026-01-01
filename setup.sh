@@ -1,19 +1,21 @@
 #!/bin/bash
 # -----------------------------------------------------------------------------
-# Script: setup.sh (v4.0 - Wrapper & Auto-Updater)
-# Description: GitOps Installer for Proxmox IaC + Host Auto-Updates
+# Script: setup.sh (v5.0 - The Full Stack)
+# Description: Installs IaC Wrapper, Host Auto-Update, and LXC Auto-Update.
 # -----------------------------------------------------------------------------
 
 set -euo pipefail
 
 # --- Configuration ---
 INSTALL_DIR="/root/iac"
-# Capture the ACTUAL current directory where this repo lives
 REPO_DIR=$(pwd)
-SERVICE_IAC="proxmox-iac"
-SERVICE_UPDATE="proxmox-autoupdate"
 
-echo ">>> Starting Proxmox Installation (v4.0)..."
+# Service Names
+SVC_IAC="proxmox-iac"
+SVC_HOST_UP="proxmox-autoupdate"
+SVC_LXC_UP="proxmox-lxc-autoupdate"
+
+echo ">>> Starting Proxmox Installation (v5.0)..."
 
 # 1. Dependency Check
 apt-get update -qq
@@ -22,40 +24,46 @@ command -v git >/dev/null 2>&1 || apt-get install -y git
 
 mkdir -p "$INSTALL_DIR"
 
-# 2. Cleanup Old Processes
+# 2. Cleanup Old Processes/Locks
 pkill -f "proxmox_dsc.sh" || true
 pkill -f "proxmox_wrapper.sh" || true
+pkill -f "proxmox_autoupdate.sh" || true
+pkill -f "proxmox_lxc_autoupdate.sh" || true
 rm -f /tmp/proxmox_dsc.lock
 
 # 3. Install Scripts
-echo "--- Installing Core Scripts ---"
+echo "--- Installing Scripts ---"
 
-# A) Install DSC Script (with Lock Fix)
-if [ -f "proxmox_dsc.sh" ]; then
-    sed 's/flock -n 200/flock -w 60 200/g' proxmox_dsc.sh > "$INSTALL_DIR/proxmox_dsc.sh"
-    chmod +x "$INSTALL_DIR/proxmox_dsc.sh"
-else
-    echo "ERROR: proxmox_dsc.sh not found!"
-    exit 1
-fi
+# Helper to copy and chmod
+install_script() {
+    local file=$1
+    if [ -f "$file" ]; then
+        # Special handling for DSC to inject lock fix if needed
+        if [ "$file" == "proxmox_dsc.sh" ]; then
+            sed 's/flock -n 200/flock -w 60 200/g' "$file" > "$INSTALL_DIR/$file"
+        else
+            cp "$file" "$INSTALL_DIR/$file"
+        fi
+        chmod +x "$INSTALL_DIR/$file"
+        echo "Installed: $file"
+    else
+        echo "ERROR: Required file $file not found in $REPO_DIR"
+        exit 1
+    fi
+}
 
-# B) Install Auto-Update Script
-if [ -f "proxmox_autoupdate.sh" ]; then
-    cp proxmox_autoupdate.sh "$INSTALL_DIR/proxmox_autoupdate.sh"
-    chmod +x "$INSTALL_DIR/proxmox_autoupdate.sh"
-else
-    echo "ERROR: proxmox_autoupdate.sh not found!"
-    exit 1
-fi
+install_script "proxmox_dsc.sh"
+install_script "proxmox_autoupdate.sh"
+install_script "proxmox_lxc_autoupdate.sh"
 
-# C) Install State File
+# Install State File
 if [ -f "state.json" ]; then
     cp state.json "$INSTALL_DIR/state.json"
 else
     echo "[]" > "$INSTALL_DIR/state.json"
 fi
 
-# 4. Generate Smart Wrapper (For IaC Workflow)
+# 4. Generate Wrapper (IaC)
 cat <<EOF > "$INSTALL_DIR/proxmox_wrapper.sh"
 #!/bin/bash
 INSTALL_DIR="/root/iac"
@@ -66,7 +74,7 @@ LOG_FILE="/var/log/proxmox_dsc.log"
 
 log() { echo "\$(date '+%Y-%m-%d %H:%M:%S') [WRAPPER] \$1" | tee -a "\$LOG_FILE"; }
 
-# Git Auto-Update Logic
+# Git Auto-Update
 if [ -d "\$REPO_DIR/.git" ]; then
     cd "\$REPO_DIR"
     if git fetch origin 2>/dev/null; then
@@ -110,13 +118,13 @@ fi
 log "Deploying..."
 "\$DSC_SCRIPT" --manifest "\$STATE_FILE"
 EOF
-
 chmod +x "$INSTALL_DIR/proxmox_wrapper.sh"
 
-# 5. Log Rotation (Combined)
+# 5. Log Rotation
 cat <<EOF > /etc/logrotate.d/proxmox_iac
 /var/log/proxmox_dsc.log 
-/var/log/proxmox_autoupdate.log {
+/var/log/proxmox_autoupdate.log
+/var/log/proxmox_lxc_autoupdate.log {
     daily
     rotate 7
     compress
@@ -129,11 +137,10 @@ cat <<EOF > /etc/logrotate.d/proxmox_iac
 EOF
 
 # 6. Systemd Units
-
 echo "--- Installing Systemd Units ---"
 
-# --- Unit 1: IaC (Existing) ---
-cat <<EOF > /etc/systemd/system/${SERVICE_IAC}.service
+# A) IaC Service (Runs via Wrapper)
+cat <<EOF > /etc/systemd/system/${SVC_IAC}.service
 [Unit]
 Description=Proxmox IaC GitOps Workflow
 After=network.target local-fs.target
@@ -145,7 +152,7 @@ User=root
 Nice=10
 EOF
 
-cat <<EOF > /etc/systemd/system/${SERVICE_IAC}.timer
+cat <<EOF > /etc/systemd/system/${SVC_IAC}.timer
 [Unit]
 Description=Run Proxmox IaC Workflow every 2 minutes
 
@@ -157,10 +164,10 @@ OnUnitActiveSec=2min
 WantedBy=timers.target
 EOF
 
-# --- Unit 2: Auto-Update (New) ---
-cat <<EOF > /etc/systemd/system/${SERVICE_UPDATE}.service
+# B) Host Auto-Update
+cat <<EOF > /etc/systemd/system/${SVC_HOST_UP}.service
 [Unit]
-Description=Proxmox Host Auto-Update and Reboot
+Description=Proxmox Host Auto-Update & Reboot
 After=network.target local-fs.target
 
 [Service]
@@ -169,14 +176,36 @@ ExecStart=$INSTALL_DIR/proxmox_autoupdate.sh
 User=root
 EOF
 
-cat <<EOF > /etc/systemd/system/${SERVICE_UPDATE}.timer
+cat <<EOF > /etc/systemd/system/${SVC_HOST_UP}.timer
 [Unit]
-Description=Run Proxmox Host Update (Weekly)
+Description=Run Proxmox Host Update (Sunday 04:00)
 
 [Timer]
-# Run every Sunday at 04:00 AM
 OnCalendar=Sun 04:00
-# Ensure it doesn't run immediately on boot if missed, to prevent reboot loops
+Persistent=false
+
+[Install]
+WantedBy=timers.target
+EOF
+
+# C) LXC Auto-Update
+cat <<EOF > /etc/systemd/system/${SVC_LXC_UP}.service
+[Unit]
+Description=Proxmox LXC Container Auto-Update
+After=network.target local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=$INSTALL_DIR/proxmox_lxc_autoupdate.sh
+User=root
+EOF
+
+cat <<EOF > /etc/systemd/system/${SVC_LXC_UP}.timer
+[Unit]
+Description=Run LXC Auto-Update (Sunday 01:00)
+
+[Timer]
+OnCalendar=Sun 01:00
 Persistent=false
 
 [Install]
@@ -185,9 +214,11 @@ EOF
 
 # 7. Activation
 systemctl daemon-reload
-systemctl enable --now ${SERVICE_IAC}.timer
-systemctl enable --now ${SERVICE_UPDATE}.timer
+systemctl enable --now ${SVC_IAC}.timer
+systemctl enable --now ${SVC_HOST_UP}.timer
+systemctl enable --now ${SVC_LXC_UP}.timer
 
-echo ">>> Installation Complete (v4.0)."
-echo "    IaC Timer:    Every 2 minutes"
-echo "    Update Timer: Sunday at 04:00 AM"
+echo ">>> Installation Complete (v5.0)."
+echo "    IaC Timer:         Every 2 minutes"
+echo "    LXC Update Timer:  Sunday 01:00"
+echo "    Host Update Timer: Sunday 04:00"
