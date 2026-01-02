@@ -66,8 +66,10 @@ flock -n 200 || { log "WARN" "Script is already running. Exiting."; exit 1; }
 # Check if ID exists in either LXC or QM
 get_resource_status() {
     local vmid=$1
-    if pct list 2>/dev/null | grep -q "^$vmid "; then echo "exists_lxc"; return; fi
-    if qm list 2>/dev/null | grep -q "^$vmid "; then echo "exists_vm"; return; fi
+    # Fix: Use awk to strip whitespace padding from the first column (VMID)
+    # Then grep for an exact line match (^ID$)
+    if pct list 2>/dev/null | awk '{print $1}' | grep -q "^$vmid$"; then echo "exists_lxc"; return; fi
+    if qm list 2>/dev/null | awk '{print $1}' | grep -q "^$vmid$"; then echo "exists_vm"; return; fi
     echo "missing"
 }
 
