@@ -5,8 +5,12 @@
     "hostname": "jellyfin",
     "template": "local:vztmpl/EXISTING",
     "memory": 8192,
+    "swap": 2048,
     "cores": 8,
-    "state": "running"
+    "state": "running",
+    "options": {
+      "onboot": 1
+    }
   },
   {
     "type": "lxc",
@@ -14,8 +18,12 @@
     "hostname": "plex-pve",
     "template": "local:vztmpl/EXISTING",
     "memory": 8192,
+    "swap": 2048,
     "cores": 8,
-    "state": "running"
+    "state": "running",
+    "options": {
+      "onboot": 1
+    }
   },
   {
     "type": "lxc",
@@ -23,8 +31,12 @@
     "hostname": "cloudflare",
     "template": "local:vztmpl/EXISTING",
     "memory": 1024,
+    "swap": 512,
     "cores": 2,
-    "state": "running"
+    "state": "running",
+    "options": {
+      "onboot": 1
+    }
   },
   {
     "type": "vm",
