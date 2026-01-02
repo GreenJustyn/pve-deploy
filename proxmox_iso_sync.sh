@@ -1,14 +1,13 @@
 #!/bin/bash
 # -----------------------------------------------------------------------------
 # Script: proxmox_iso_sync.sh
-# Description: ISO State Reconciliation. Downloads new ISOs, removes old/foreign ones.
+# Description: Dynamic ISO Scraper & Sync. Finds latest ISOs from provider pages.
 # Schedule: Daily @ 02:00
 # -----------------------------------------------------------------------------
 
 set -u
 
 # --- Configuration ---
-# Target Storage ID in Proxmox (Default is usually 'local')
 STORAGE_ID="local"
 LOG_FILE="/var/log/proxmox_iso_sync.log"
 MANIFEST="/root/iac/iso-images.json"
@@ -19,91 +18,91 @@ log() {
     echo "[$timestamp] $1" | tee -a "$LOG_FILE"
 }
 
-log "=== Starting ISO Sync Routine ==="
+log "=== Starting Dynamic ISO Sync Routine ==="
 
-# 1. Validate Environment
-if ! command -v jq &> /dev/null; then
-    log "ERROR: jq is missing. Please install it."
-    exit 1
-fi
+# 1. Validation
+if ! command -v jq &> /dev/null; then log "ERROR: jq missing."; exit 1; fi
+if [ ! -f "$MANIFEST" ]; then log "ERROR: Manifest $MANIFEST missing."; exit 1; fi
 
-if [ ! -f "$MANIFEST" ]; then
-    log "ERROR: Manifest file $MANIFEST not found."
-    exit 1
-fi
-
-# 2. Get Local ISO Directory Path
-# pvesm path returns something like "/var/lib/vz/template/iso/file.iso"
-# We just want the directory.
+# 2. Storage Path Detection
 STORAGE_PATH=$(pvesm path "$STORAGE_ID:iso" 2>/dev/null | xargs dirname 2>/dev/null)
-
-# Fallback if pvesm fails (common on some setups)
 if [ -z "$STORAGE_PATH" ] || [ "$STORAGE_PATH" == "." ]; then
     STORAGE_PATH="/var/lib/vz/template/iso"
-    log "WARN: Could not detect path via pvesm. Defaulting to $STORAGE_PATH"
+    log "WARN: pvesm failed. Defaulting to $STORAGE_PATH"
 fi
-
-if [ ! -d "$STORAGE_PATH" ]; then
-    log "ERROR: Storage path $STORAGE_PATH does not exist."
-    exit 1
-fi
+if [ ! -d "$STORAGE_PATH" ]; then log "ERROR: Path $STORAGE_PATH not found."; exit 1; fi
 
 log "INFO: Managing ISOs in $STORAGE_PATH"
 
-# 3. Build Expected File List from JSON
-declare -a EXPECTED_ISOS=()
-while IFS= read -r filename; do
-    EXPECTED_ISOS+=("$filename")
-done < <(jq -r '.[].filename' "$MANIFEST")
+# 3. Dynamic Discovery & Download
+declare -a KEPT_FILES=()
 
-# 4. DOWNLOAD PHASE (Reconciliation)
-# Loop through JSON definitions
-for row in $(jq -r '.[] | @base64' "$MANIFEST"); do
-    _jq() { echo ${row} | base64 --decode | jq -r ${1}; }
-    
-    NAME=$(_jq '.filename')
-    URL=$(_jq '.url')
-    OS=$(_jq '.os')
-    
-    TARGET_FILE="$STORAGE_PATH/$NAME"
+# Read JSON array
+COUNT=$(jq '. | length' "$MANIFEST")
+for ((i=0; i<$COUNT; i++)); do
+    OS=$(jq -r ".[$i].os" "$MANIFEST")
+    PAGE=$(jq -r ".[$i].source_page" "$MANIFEST")
+    PATTERN=$(jq -r ".[$i].pattern" "$MANIFEST")
 
-    if [ -f "$TARGET_FILE" ]; then
-        # File exists - we assume it's good (Checking hash would be better, but slow)
-        log "OK: $NAME ($OS) exists."
+    log "CHECKING: $OS (Pattern: $PATTERN)..."
+
+    # Scrape the page for the file name
+    # We look for href="PATTERN" or just the text matching PATTERN
+    # sort -V sorts version numbers correctly (e.g. 22.04.2 vs 22.04.10)
+    LATEST_FILE=$(curl -sL "$PAGE" | grep -oP "$PATTERN" | sort -V | tail -n 1)
+
+    if [ -z "$LATEST_FILE" ]; then
+        log "ERROR: Could not find any file matching '$PATTERN' on $PAGE"
+        continue
+    fi
+
+    # Construct Full Download URL
+    # If PAGE ends with /, append file. Otherwise add /.
+    if [[ "$PAGE" == */ ]]; then
+        DOWNLOAD_URL="${PAGE}${LATEST_FILE}"
     else
-        log "MISSING: $NAME ($OS). Downloading..."
-        log "SOURCE: $URL"
+        DOWNLOAD_URL="${PAGE}/${LATEST_FILE}"
+    fi
+
+    TARGET_FILE="$STORAGE_PATH/$LATEST_FILE"
+    KEPT_FILES+=("$LATEST_FILE")
+
+    # Reconciliation Logic
+    if [ -f "$TARGET_FILE" ]; then
+        log "OK: $LATEST_FILE is current."
+    else
+        log "NEW VERSION FOUND: $LATEST_FILE"
+        log "DOWNLOADING: $DOWNLOAD_URL"
         
-        # Download with wget (using temp file to prevent partials)
-        if wget -q --show-progress -O "${TARGET_FILE}.tmp" "$URL"; then
+        if wget -q --show-progress -O "${TARGET_FILE}.tmp" "$DOWNLOAD_URL"; then
             mv "${TARGET_FILE}.tmp" "$TARGET_FILE"
-            log "SUCCESS: Downloaded $NAME"
+            log "SUCCESS: Downloaded $LATEST_FILE"
         else
-            log "ERROR: Failed to download $NAME"
+            log "ERROR: Download failed for $LATEST_FILE"
             rm -f "${TARGET_FILE}.tmp"
         fi
     fi
 done
 
-# 5. CLEANUP PHASE (Foreign Object Detection)
-# We list files in the directory and delete any NOT in our EXPECTED_ISOS array
-log "AUDIT: Checking for obsolete or foreign ISO files..."
+# 4. Cleanup (Foreign & Old Version Detection)
+log "AUDIT: Checking for obsolete ISO files..."
 
-# Get list of .iso files in directory
+# List all ISOs currently in storage
 EXISTING_FILES=$(ls "$STORAGE_PATH"/*.iso 2>/dev/null | xargs -n 1 basename)
 
 for file in $EXISTING_FILES; do
-    # Check if file is in EXPECTED_ISOS
-    is_expected=false
-    for expected in "${EXPECTED_ISOS[@]}"; do
-        if [[ "$file" == "$expected" ]]; then
-            is_expected=true
+    is_kept=false
+    for kept in "${KEPT_FILES[@]}"; do
+        if [[ "$file" == "$kept" ]]; then
+            is_kept=true
             break
         fi
     done
 
-    if [ "$is_expected" == "false" ]; then
-        log "DELETE: $file is not in the manifest (Obsolete/Foreign). Removing..."
+    if [ "$is_kept" == "false" ]; then
+        # Check if this file "looks like" one of our managed OSs but is an old version
+        # This is optional safety, but here we strictly delete anything not in KEPT_FILES
+        log "DELETE: $file (Obsolete or Foreign). Removing..."
         rm -f "$STORAGE_PATH/$file"
         log "SUCCESS: Deleted $file"
     fi
