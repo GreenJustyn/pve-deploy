@@ -1,20 +1,14 @@
 [
     {
         "os": "Debian",
-        "version": "12.2.0",
-        "filename": "debian-12.2.0-amd64-netinst.iso",
-        "url": "https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/debian-12.2.0-amd64-netinst.iso"
+        "version": "13.2.0",
+        "filename": "debian-13.2.0-amd64-netinst.iso",
+        "url": "https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/debian-13.2.0-amd64-netinst.iso"
     },
     {
         "os": "Ubuntu Server",
-        "version": "22.04.3",
-        "filename": "ubuntu-22.04.3-live-server-amd64.iso",
-        "url": "https://releases.ubuntu.com/jammy/ubuntu-22.04.3-live-server-amd64.iso"
-    },
-    {
-        "os": "Proxmox Mail Gateway",
-        "version": "8.0",
-        "filename": "proxmox-mailgateway-8.0-1.iso",
-        "url": "https://enterprise.proxmox.com/iso/proxmox-mailgateway-8.0-1.iso"
+        "version": "22.04.5",
+        "filename": "ubuntu-22.04.5-live-server-amd64.iso",
+        "url": "https://releases.ubuntu.com/jammy/ubuntu-22.04.5-live-server-amd64.iso"
     }
 ]
