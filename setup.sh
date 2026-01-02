@@ -1,7 +1,7 @@
 #!/bin/bash
 # -----------------------------------------------------------------------------
-# Script: setup.sh (v9.0 - Central Logging & High Verbosity)
-# Description: Installs Centralized Logging, Master Log, and Verbose Execution
+# Script: setup.sh (v9.1 - Complete GitOps Installer)
+# Description: Installs IaC Engine, Central Logging, Auto-Updates, and Fixes.
 # -----------------------------------------------------------------------------
 
 set -euo pipefail
@@ -16,7 +16,7 @@ SVC_HOST_UP="proxmox-autoupdate"
 SVC_LXC_UP="proxmox-lxc-autoupdate"
 SVC_ISO="proxmox-iso-sync"
 
-echo ">>> Starting Proxmox Installation (v9.0)..."
+echo ">>> Starting Proxmox Installation (v9.1)..."
 
 # 1. Dependency Check
 apt-get update -qq
@@ -33,63 +33,44 @@ pkill -9 -f "proxmox_lxc_autoupdate.sh" || true
 pkill -9 -f "proxmox_iso_sync.sh" || true
 rm -f /tmp/proxmox_dsc.lock
 
-# --- NEW: Create Common Library ---
+# --- PART A: Central Logging Library ---
+echo "--- Installing Common Library ---"
 cat <<'EOF' > "$INSTALL_DIR/common.lib"
 # Proxmox IaC Common Library
 MASTER_LOG="/var/log/proxmox_master.log"
 
-# Unified Logger
-# Usage: log "LEVEL" "Message"
 log() {
     local level="$1"
     local msg="$2"
     local script_name=$(basename "$0")
     local timestamp=$(date "+%Y-%m-%d %H:%M:%S")
-
-    # Construct the Log Line
     local log_line="[$timestamp] [$script_name] [$level] $msg"
     local local_line="[$timestamp] [$level] $msg"
 
-    # 1. Write to Master Log
+    # Write to Master, Local, and Stdout
     echo "$log_line" >> "$MASTER_LOG"
-
-    # 2. Write to Local Log (if defined by the script)
-    if [[ -n "${LOG_FILE:-}" ]]; then
-        echo "$local_line" >> "$LOG_FILE"
-    fi
-
-    # 3. Output to Stdout (for Systemd Journal)
+    if [[ -n "${LOG_FILE:-}" ]]; then echo "$local_line" >> "$LOG_FILE"; fi
     echo "$log_line"
 }
 
-# Verbose Execution Wrapper with Timeout
-# Usage: safe_exec command arg1 arg2 ...
+# Timeout Wrapper (Max 300s)
 safe_exec() {
     local timeout_dur="300s"
     local cmd_str="$*"
-    
-    # Verbose Start
-    log "DEBUG" "EXEC: '$cmd_str' (Max: $timeout_dur)..."
-
-    # Execute with Timeout
+    log "DEBUG" "EXEC: '$cmd_str'..."
     timeout "$timeout_dur" "$@"
     local status=$?
-
-    # Handle Results
     if [ $status -eq 124 ]; then
-        log "CRITICAL" "TIMEOUT REACHED: Command ran for >$timeout_dur and was killed: $cmd_str"
+        log "CRITICAL" "TIMEOUT: Command killed after $timeout_dur: $cmd_str"
         return 124
     elif [ $status -ne 0 ]; then
         log "WARN" "Command failed (Exit $status): $cmd_str"
         return $status
-    else
-        # Optional: Log success for very long running commands?
-        # log "DEBUG" "Success: $cmd_str"
-        return 0
     fi
+    return 0
 }
 
-# Cold Apply Helper
+# Cold Apply Helper (Stop -> Apply -> Start)
 apply_and_restart() {
     local vmid=$1
     local type=$2
@@ -109,72 +90,274 @@ apply_and_restart() {
     safe_exec $cmd "$vmid" $args
     
     log "ACTION" "Starting $type $vmid..."
-    if [ "$type" == "vm" ]; then
-        safe_exec qm start "$vmid"
-    else
-        safe_exec pct start "$vmid"
-    fi
+    if [ "$type" == "vm" ]; then safe_exec qm start "$vmid"; else safe_exec pct start "$vmid"; fi
 }
 EOF
 
-# 3. Install & Patch Scripts
-echo "--- Installing & Patching Scripts ---"
+# --- PART B: Core DSC Engine (Written directly to guarantee v9.1 Logic) ---
+echo "--- Installing Core DSC Engine (v9.1) ---"
+cat <<'EOF' > "$INSTALL_DIR/proxmox_dsc.sh"
+#!/bin/bash
+source /root/iac/common.lib
+# Script: proxmox_dsc.sh (v9.1)
+LOCK_FILE="/tmp/proxmox_dsc.lock"
+LOG_FILE="/var/log/proxmox_dsc.log"
+MANIFEST=""
+DRY_RUN=false
+declare -a MANAGED_VMIDS=()
 
-# Helper to copy and patch a script
-install_and_patch() {
-    local filename=$1
-    if [ -f "$filename" ]; then
-        # Copy to install dir
-        cp "$filename" "$INSTALL_DIR/$filename"
-        
-        # PATCH 1: Remove local log() function definitions
-        # We delete lines starting with 'log() {' down to the closing '}'
-        # This relies on the function being formatted normally.
-        sed -i '/^log() {/,/^}/d' "$INSTALL_DIR/$filename"
-        
-        # PATCH 2: Remove old safe_exec/apply functions if they exist (to avoid dupes)
-        sed -i '/^safe_exec() {/,/^}/d' "$INSTALL_DIR/$filename"
-        sed -i '/^apply_and_restart() {/,/^}/d' "$INSTALL_DIR/$filename"
+while [[ "$#" -gt 0 ]]; do
+    case $1 in
+        --manifest) MANIFEST="$2"; shift ;;
+        --dry-run) DRY_RUN=true ;;
+    esac; shift
+done
 
-        # PATCH 3: Inject "source common.lib" after the shebang
-        sed -i '2i source /root/iac/common.lib' "$INSTALL_DIR/$filename"
+exec 200>"$LOCK_FILE"
+flock -w 300 200 || { log "WARN" "Could not acquire lock after 300s. Exiting."; exit 1; }
+
+get_resource_status() {
+    local vmid=$1
+    if safe_exec pct list 2>/dev/null | awk '{print $1}' | grep -q "^$vmid$"; then echo "exists_lxc"; return; fi
+    if safe_exec qm list 2>/dev/null | awk '{print $1}' | grep -q "^$vmid$"; then echo "exists_vm"; return; fi
+    echo "missing"
+}
+
+get_power_state() {
+    local vmid=$1
+    local type=$2
+    if [[ "$type" == "lxc" ]]; then safe_exec pct status "$vmid" | awk '{print $2}'; else safe_exec qm status "$vmid" | awk '{print $2}'; fi
+}
+
+# Smart Cloud-Init Reconciler (Fix for v9.1)
+reconcile_cloudinit() {
+    local vmid=$1
+    local config=$2
+    local storage=$3
+    
+    if [[ $(echo "$config" | jq -r ".cloud_init.enable") == "true" ]]; then
+        local ci_user=$(echo "$config" | jq -r ".cloud_init.user")
+        local ci_ssh=$(echo "$config" | jq -r ".cloud_init.sshkeys")
+        local ci_ip=$(echo "$config" | jq -r ".cloud_init.ipconfig0")
         
-        # PATCH 4: Ensure variables are set for the logger
-        # proxmox_iso_sync doesn't define LOG_FILE variable usually, let's ensure it does if missing
-        # (Actually your scripts do define LOG_FILE, so this is fine)
+        local cur_ide2=$(safe_exec qm config "$vmid" | grep "ide2:")
+        local update_ci_settings=false
         
-        chmod +x "$INSTALL_DIR/$filename"
-        echo "Installed & Patched: $filename"
-    else
-        echo "WARN: $filename not found in repo."
+        # Check for Missing Drive OR Wrong Media (ISO in CloudInit slot)
+        if [[ -z "$cur_ide2" ]] || (echo "$cur_ide2" | grep -q "media=cdrom" && echo "$cur_ide2" | grep -q "\.iso"); then
+             log "WARN" "Drift $vmid: Cloud-Init drive missing or holding ISO. Fixing..."
+             if [[ "$DRY_RUN" == "false" ]]; then
+                 local store_name=$(echo "$storage" | awk -F: "{print \$1}")
+                 apply_and_restart "$vmid" "vm" qm "set --ide2 ${store_name}:cloudinit"
+                 update_ci_settings=true
+             fi
+        fi
+        
+        local cur_ciuser=$(safe_exec qm config "$vmid" | grep "ciuser:" | awk "{print \$2}")
+        if [[ "$cur_ciuser" != "$ci_user" ]]; then
+             log "INFO" "Drift $vmid: Cloud-Init User/Settings mismatch."
+             update_ci_settings=true
+        fi
+        
+        if [[ "$update_ci_settings" == "true" ]]; then
+             log "INFO" "Enforcing Cloud-Init Settings for VM $vmid..."
+             if [[ "$DRY_RUN" == "false" ]]; then
+                 safe_exec qm set "$vmid" --ciuser "$ci_user" --sshkeys <(echo "$ci_ssh") --ipconfig0 "$ci_ip"
+             fi
+        fi
     fi
 }
 
-install_and_patch "proxmox_dsc.sh"
+reconcile_lxc() {
+    local config="$1"
+    local vmid=$(echo "$config" | jq -r '.vmid')
+    local hostname=$(echo "$config" | jq -r '.hostname')
+    local template=$(echo "$config" | jq -r '.template')
+    local memory=$(echo "$config" | jq -r '.memory')
+    local swap=$(echo "$config" | jq -r '.swap // 512')
+    local cores=$(echo "$config" | jq -r '.cores')
+    local storage=$(echo "$config" | jq -r '.storage')
+    local net0=$(echo "$config" | jq -r '.net0')
+    local onboot=$(echo "$config" | jq -r '.options.onboot // 0')
+    local protection=$(echo "$config" | jq -r '.options.protection // 0')
+    local desired_state=$(echo "$config" | jq -r '.state')
+
+    log "INFO" "[LXC] Processing VMID: $vmid ($hostname)..."
+    local status=$(get_resource_status "$vmid")
+
+    if [[ "$status" == "missing" ]]; then
+        log "WARN" "LXC $vmid missing. Creating..."
+        if [[ "$DRY_RUN" == "false" ]]; then
+            safe_exec pct create "$vmid" "$template" --hostname "$hostname" --memory "$memory" --swap "$swap" --cores "$cores" --net0 "$net0" --rootfs "$storage" --onboot "$onboot" --protection "$protection" --features nesting=1 || return 1
+            log "SUCCESS" "LXC $vmid created."
+        fi
+    elif [[ "$status" == "exists_vm" ]]; then
+        log "ERROR" "ID Conflict: $vmid is LXC but exists as VM."
+        return 1
+    else
+        # Drift Detection with Cold Apply
+        local cur_mem=$(safe_exec pct config "$vmid" | grep "memory:" | awk '{print $2}')
+        if [[ "$cur_mem" != "$memory" ]]; then
+            log "INFO" "Drift $vmid: Memory $cur_mem -> $memory"
+            [[ "$DRY_RUN" == "false" ]] && apply_and_restart "$vmid" "lxc" pct "set --memory $memory"
+        fi
+        local cur_swap=$(safe_exec pct config "$vmid" | grep "swap:" | awk '{print $2}')
+        if [[ "${cur_swap:-0}" != "$swap" ]]; then
+            log "INFO" "Drift $vmid: Swap ${cur_swap:-0} -> $swap"
+            [[ "$DRY_RUN" == "false" ]] && apply_and_restart "$vmid" "lxc" pct "set --swap $swap"
+        fi
+        local cur_cores=$(safe_exec pct config "$vmid" | grep "cores:" | awk '{print $2}')
+        if [[ "$cur_cores" != "$cores" ]]; then
+            log "INFO" "Drift $vmid: Cores $cur_cores -> $cores"
+            [[ "$DRY_RUN" == "false" ]] && apply_and_restart "$vmid" "lxc" pct "set --cores $cores"
+        fi
+        local cur_onboot=$(safe_exec pct config "$vmid" | grep "onboot:" | awk '{print $2}')
+        if [[ "${cur_onboot:-0}" != "$onboot" ]]; then
+            log "INFO" "Drift $vmid: OnBoot ${cur_onboot:-0} -> $onboot"
+            [[ "$DRY_RUN" == "false" ]] && apply_and_restart "$vmid" "lxc" pct "set --onboot $onboot"
+        fi
+    fi
+
+    local actual_state=$(get_power_state "$vmid" "lxc")
+    if [[ "$desired_state" == "running" && "$actual_state" == "stopped" ]]; then
+        log "INFO" "Starting LXC $vmid..."
+        if [[ "$DRY_RUN" == "false" ]]; then safe_exec pct start "$vmid"; fi
+    elif [[ "$desired_state" == "stopped" && "$actual_state" == "running" ]]; then
+        log "INFO" "Stopping LXC $vmid..."
+        if [[ "$DRY_RUN" == "false" ]]; then safe_exec pct shutdown "$vmid"; fi
+    fi
+}
+
+reconcile_vm() {
+    local config="$1"
+    local vmid=$(echo "$config" | jq -r '.vmid')
+    local hostname=$(echo "$config" | jq -r '.hostname')
+    local iso=$(echo "$config" | jq -r '.template')
+    local memory=$(echo "$config" | jq -r '.memory')
+    local cores=$(echo "$config" | jq -r '.cores')
+    local sockets=$(echo "$config" | jq -r '.sockets // 1')
+    local cpu_type=$(echo "$config" | jq -r '.cpu // "kvm64"')
+    local net0=$(echo "$config" | jq -r '.net0')
+    local storage=$(echo "$config" | jq -r '.storage')
+    local onboot=$(echo "$config" | jq -r '.options.onboot // 0')
+    local protection=$(echo "$config" | jq -r '.options.protection // 0')
+    local desired_state=$(echo "$config" | jq -r '.state')
+
+    log "INFO" "[VM] Processing VMID: $vmid ($hostname)..."
+    local status=$(get_resource_status "$vmid")
+
+    if [[ "$status" == "missing" ]]; then
+        log "WARN" "VM $vmid missing. Creating..."
+        if [[ "$DRY_RUN" == "false" ]]; then
+            if safe_exec qm create "$vmid" --name "$hostname" --memory "$memory" --cores "$cores" --sockets "$sockets" --cpu "$cpu_type" --net0 "$net0" --scsi0 "$storage" --cdrom "$iso" --scsihw virtio-scsi-pci --boot order=scsi0;ide2;net0 --onboot "$onboot" --protection "$protection"; then
+                if [[ $(echo "$config" | jq -r '.cloud_init.enable') == "true" ]]; then
+                    reconcile_cloudinit "$vmid" "$config" "$storage"
+                fi
+                log "SUCCESS" "VM $vmid created."
+            fi
+        fi
+    elif [[ "$status" == "exists_lxc" ]]; then
+        log "ERROR" "ID Conflict: $vmid is VM but exists as LXC."
+        return 1
+    else
+        # Drift Detection
+        local cur_mem=$(safe_exec qm config "$vmid" | grep "memory:" | awk '{print $2}')
+        if [[ "$cur_mem" != "$memory" ]]; then
+            log "INFO" "Drift $vmid: Memory $cur_mem -> $memory"
+            [[ "$DRY_RUN" == "false" ]] && apply_and_restart "$vmid" "vm" qm "set --memory $memory"
+        fi
+        local cur_cores=$(safe_exec qm config "$vmid" | grep "cores:" | awk '{print $2}')
+        if [[ "$cur_cores" != "$cores" ]]; then
+            log "INFO" "Drift $vmid: Cores $cur_cores -> $cores"
+            [[ "$DRY_RUN" == "false" ]] && apply_and_restart "$vmid" "vm" qm "set --cores $cores"
+        fi
+        local cur_cpu=$(safe_exec qm config "$vmid" | grep "cpu:" | awk '{print $2}')
+        if [[ "${cur_cpu:-kvm64}" != "$cpu_type" ]]; then
+            log "WARN" "Drift $vmid: CPU Type ${cur_cpu:-kvm64} -> $cpu_type"
+            [[ "$DRY_RUN" == "false" ]] && apply_and_restart "$vmid" "vm" qm "set --cpu $cpu_type"
+        fi
+        local cur_net0=$(safe_exec qm config "$vmid" | grep "net0:" | awk '{$1=""; print $0}' | xargs)
+        if [[ "$cur_net0" != "$net0" ]]; then
+             log "INFO" "Drift $vmid: Network Config Changed."
+             [[ "$DRY_RUN" == "false" ]] && apply_and_restart "$vmid" "vm" qm "set --net0 $net0"
+        fi
+
+        # Cloud-Init Check
+        reconcile_cloudinit "$vmid" "$config" "$storage"
+    fi
+
+    local actual_state=$(get_power_state "$vmid" "vm")
+    if [[ "$desired_state" == "running" && "$actual_state" == "stopped" ]]; then
+        log "INFO" "Starting VM $vmid..."
+        if [[ "$DRY_RUN" == "false" ]]; then safe_exec qm start "$vmid"; fi
+    elif [[ "$desired_state" == "stopped" && "$actual_state" == "running" ]]; then
+        log "INFO" "Stopping VM $vmid..."
+        if [[ "$DRY_RUN" == "false" ]]; then safe_exec qm shutdown "$vmid"; fi
+    fi
+}
+
+reconcile_dispatch() {
+    local config="$1"
+    local type=$(echo "$config" | jq -r '.type')
+    local vmid=$(echo "$config" | jq -r '.vmid')
+    MANAGED_VMIDS+=("$vmid")
+    if [[ "$type" == "lxc" ]]; then reconcile_lxc "$config"; elif [[ "$type" == "vm" ]]; then reconcile_vm "$config"; fi
+}
+
+detect_unmanaged_workloads() {
+    log "INFO" "Starting Audit for Unmanaged Workloads..."
+    local lxc_list=$(safe_exec pct list 2>/dev/null | awk 'NR>1 {print $1}')
+    local vm_list=$(safe_exec qm list 2>/dev/null | awk 'NR>1 {print $1}')
+    local all_vms="$lxc_list"$'\n'"$vm_list"
+    local found_foreign=false
+    for host_vmid in $all_vms; do
+        [[ -z "$host_vmid" ]] && continue
+        local is_managed=false
+        for managed_id in "${MANAGED_VMIDS[@]}"; do if [[ "$host_vmid" == "$managed_id" ]]; then is_managed=true; break; fi; done
+        if [[ "$is_managed" == "false" ]]; then
+            found_foreign=true
+            log "WARN" "FOREIGN DETECTED: VMID $host_vmid"
+        fi
+    done
+    if [[ "$found_foreign" == "true" ]]; then echo "FOREIGN WORKLOADS FOUND"; fi
+}
+
+log "INFO" "Run Started. Processing Manifest: $MANIFEST"
+for row in $(cat "$MANIFEST" | jq -r '.[] | @base64'); do
+    _jq() { echo ${row} | base64 --decode | jq -r ${1}; }
+    current_config=$(echo ${row} | base64 --decode)
+    reconcile_dispatch "$current_config"
+done
+detect_unmanaged_workloads
+log "INFO" "Run complete."
+EOF
+chmod +x "$INSTALL_DIR/proxmox_dsc.sh"
+
+# --- PART C: Install & Patch Other Scripts ---
+echo "--- Patching & Installing Auxiliary Scripts ---"
+
+# Function to patch a script to use common.lib and remove local logs
+install_and_patch() {
+    local filename=$1
+    if [ -f "$filename" ]; then
+        cp "$filename" "$INSTALL_DIR/$filename"
+        # 1. Remove local log() function
+        sed -i '/^log() {/,/^}/d' "$INSTALL_DIR/$filename"
+        # 2. Inject source common.lib
+        sed -i '2i source /root/iac/common.lib' "$INSTALL_DIR/$filename"
+        chmod +x "$INSTALL_DIR/$filename"
+        echo "Installed: $filename"
+    fi
+}
 install_and_patch "proxmox_autoupdate.sh"
 install_and_patch "proxmox_lxc_autoupdate.sh"
 install_and_patch "proxmox_iso_sync.sh"
 
-# Post-Patching specifics for DSC (Drift Logic)
-# Since we removed safe_exec/apply definitions above, we need to ensure the script USES them.
-# The v8.0 injection logic for 'pct set' -> 'apply_and_restart' is still needed if not present in source.
-# We re-run the sed replacements for usage:
-
-TGT="$INSTALL_DIR/proxmox_dsc.sh"
-sed -i 's/pct set "\$vmid"/apply_and_restart "\$vmid" "lxc" pct/g' "$TGT"
-sed -i 's/qm set "\$vmid"/apply_and_restart "\$vmid" "vm" qm/g' "$TGT"
-sed -i 's/pct list/safe_exec pct list/g' "$TGT"
-sed -i 's/qm list/safe_exec qm list/g' "$TGT"
-sed -i 's/pct /safe_exec pct /g' "$TGT"
-sed -i 's/qm /safe_exec qm /g' "$TGT"
-# Fix the safe_exec double-wrap if run multiple times (safe_exec safe_exec)
-sed -i 's/safe_exec safe_exec/safe_exec/g' "$TGT"
-
-# Install Config Files
+# Config Files
 if [ -f "state.json" ]; then cp state.json "$INSTALL_DIR/state.json"; else echo "[]" > "$INSTALL_DIR/state.json"; fi
 if [ -f "iso-images.json" ]; then cp iso-images.json "$INSTALL_DIR/iso-images.json"; else echo "[]" > "$INSTALL_DIR/iso-images.json"; fi
 
-# 4. Generate Wrapper (IaC) - Also needs patching
+# --- PART D: Wrapper (with Central Logging) ---
 cat <<EOF > "$INSTALL_DIR/proxmox_wrapper.sh"
 #!/bin/bash
 source /root/iac/common.lib
@@ -184,50 +367,41 @@ DSC_SCRIPT="\$INSTALL_DIR/proxmox_dsc.sh"
 STATE_FILE="\$INSTALL_DIR/state.json"
 LOG_FILE="/var/log/proxmox_dsc.log"
 
-# Git Auto-Update Logic
 if [ -d "\$REPO_DIR/.git" ]; then
     cd "\$REPO_DIR"
     if git fetch origin 2>/dev/null; then
         LOCAL=\$(git rev-parse HEAD)
         REMOTE=\$(git rev-parse @{u})
-
         if [ "\$LOCAL" != "\$REMOTE" ]; then
-            log "INFO" "Update detected (\$LOCAL -> \$REMOTE). Pulling..."
+            log "INFO" "Update detected. Pulling..."
             if ! output=\$(git pull 2>&1); then
                 log "ERROR" "Git pull failed. \$output"
             else
                 if [ "\$(git rev-parse HEAD)" != "\$LOCAL" ]; then
-                    log "INFO" "Git updated. Executing Setup..."
-                    if [ -f "./setup.sh" ]; then
-                        chmod +x ./setup.sh
-                        ./setup.sh >> "\$LOG_FILE" 2>&1
-                        log "INFO" "Setup complete. Exiting clean."
-                        exit 0
-                    fi
+                    log "INFO" "Git updated. Re-running Setup..."
+                    [ -f "./setup.sh" ] && chmod +x ./setup.sh && ./setup.sh >> "\$LOG_FILE" 2>&1
+                    exit 0
                 fi
             fi
         fi
     fi
 fi
 
-# Validation & Deployment
 DRY_OUTPUT=\$("\$DSC_SCRIPT" --manifest "\$STATE_FILE" --dry-run 2>&1)
 EXIT_CODE=\$?
 
 if [ \$EXIT_CODE -ne 0 ]; then
-    log "CRITICAL" "Dry run failed (Exit Code \$EXIT_CODE). Aborting."
+    log "CRITICAL" "Dry run failed."
     echo "\$DRY_OUTPUT" | tee -a "\$LOG_FILE"
     exit 1
 fi
-
 if echo "\$DRY_OUTPUT" | grep -q "FOREIGN"; then
-    log "WARN" "BLOCK: Foreign workloads detected. Aborting."
+    log "WARN" "BLOCK: Foreign workloads detected."
     echo "\$DRY_OUTPUT" | grep "FOREIGN" | tee -a "\$LOG_FILE"
     exit 0
 fi
-
 if echo "\$DRY_OUTPUT" | grep -q "ERROR"; then
-    log "WARN" "BLOCK: Errors detected. Aborting."
+    log "WARN" "BLOCK: Errors detected."
     exit 0
 fi
 
@@ -236,7 +410,7 @@ log "INFO" "Deploying..."
 EOF
 chmod +x "$INSTALL_DIR/proxmox_wrapper.sh"
 
-# 5. Log Rotation (Include Master Log)
+# --- PART E: Log Rotation & Units ---
 cat <<EOF > /etc/logrotate.d/proxmox_iac
 /var/log/proxmox_master.log
 /var/log/proxmox_dsc.log 
@@ -254,14 +428,12 @@ cat <<EOF > /etc/logrotate.d/proxmox_iac
 }
 EOF
 
-# 6. Systemd Units (Standard - Unchanged)
-# (For brevity in v9.0, we just reload the existing ones as they haven't changed structure)
+# Reload Systemd (Units presumed installed by previous runs, just reload config)
 systemctl daemon-reload
 systemctl enable --now ${SVC_IAC}.timer
 systemctl enable --now ${SVC_HOST_UP}.timer
 systemctl enable --now ${SVC_LXC_UP}.timer
 systemctl enable --now ${SVC_ISO}.timer
 
-echo ">>> Installation Complete (v9.0)."
-echo "    FEATURE: Central Logging Active (/var/log/proxmox_master.log)"
-echo "    FEATURE: Verbose Execution Logging Active"
+echo ">>> Installation Complete (v9.1)."
+echo "    Core Engine Rewritten with Cloud-Init Fix & Central Logging."

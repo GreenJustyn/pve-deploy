@@ -42,7 +42,7 @@
     "type": "vm",
     "vmid": 500,
     "hostname": "prod-ubuntu-web-01",
-    "template": "local:iso/ubuntu-22.04.5-live-server-amd64.iso",
+    "template": "",
     "memory": 8192,
     "cores": 4,
     "cpu": "host",
