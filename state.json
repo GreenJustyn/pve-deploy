@@ -37,29 +37,5 @@
     "options": {
       "onboot": 1
     }
-  },
-  {
-    "type": "vm",
-    "vmid": 500,
-    "hostname": "prod-ubuntu-web-01",
-    "template": "",
-    "memory": 8192,
-    "cores": 4,
-    "cpu": "host",
-    "sockets": 1,
-    "storage": "local-lvm:100",
-    "net0": "virtio,bridge=vmbr0",
-    "state": "running",
-    "cloud_init": {
-      "enable": true,
-      "user": "deploy-admin",
-      "sshkeys": "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQC..."
-    },
-    "options": {
-      "onboot": 1,
-      "agent": 1,
-      "protection": 1,
-      "watchdog": "model=i6300esb,action=reset"
-    }
   }
 ]
