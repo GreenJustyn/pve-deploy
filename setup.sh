@@ -1,6 +1,6 @@
 #!/bin/bash
 # -----------------------------------------------------------------------------
-# Script: setup.sh (v6.1 - Robust Re-Install)
+# Script: setup.sh (v6.2 - Fixed Parent Process Kill Bug)
 # Description: Installs IaC Wrapper, Host Update, LXC Update, and ISO Manager.
 # -----------------------------------------------------------------------------
 
@@ -16,7 +16,7 @@ SVC_HOST_UP="proxmox-autoupdate"
 SVC_LXC_UP="proxmox-lxc-autoupdate"
 SVC_ISO="proxmox-iso-sync"
 
-echo ">>> Starting Proxmox Installation (v6.1)..."
+echo ">>> Starting Proxmox Installation (v6.2)..."
 
 # 1. Dependency Check
 apt-get update -qq
@@ -27,8 +27,8 @@ command -v wget >/dev/null 2>&1 || apt-get install -y wget
 mkdir -p "$INSTALL_DIR"
 
 # 2. Cleanup Old Processes
+# FIX: Removed pkill -f "proxmox_wrapper.sh" to prevent killing the parent process during update
 pkill -f "proxmox_dsc.sh" || true
-pkill -f "proxmox_wrapper.sh" || true
 pkill -f "proxmox_autoupdate.sh" || true
 pkill -f "proxmox_lxc_autoupdate.sh" || true
 pkill -f "proxmox_iso_sync.sh" || true
@@ -62,7 +62,7 @@ install_script "proxmox_iso_sync.sh"
 if [ -f "state.json" ]; then cp state.json "$INSTALL_DIR/state.json"; else echo "[]" > "$INSTALL_DIR/state.json"; fi
 if [ -f "iso-images.json" ]; then cp iso-images.json "$INSTALL_DIR/iso-images.json"; else echo "[]" > "$INSTALL_DIR/iso-images.json"; fi
 
-# 4. Generate Wrapper (IaC) - UPDATED LOGIC HERE
+# 4. Generate Wrapper (IaC)
 cat <<EOF > "$INSTALL_DIR/proxmox_wrapper.sh"
 #!/bin/bash
 INSTALL_DIR="/root/iac"
@@ -256,7 +256,7 @@ systemctl enable --now ${SVC_HOST_UP}.timer
 systemctl enable --now ${SVC_LXC_UP}.timer
 systemctl enable --now ${SVC_ISO}.timer
 
-echo ">>> Installation Complete (v6.1)."
+echo ">>> Installation Complete (v6.2)."
 echo "    IaC Timer:         Every 2 minutes"
 echo "    LXC Update Timer:  Sunday 01:00"
 echo "    ISO Sync Timer:    Daily 02:00"
