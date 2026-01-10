@@ -20,8 +20,9 @@
         "pattern": "proxmox-ve-9.[0-9]+-[0-9]+.iso"
     },
     {
-        "os": "Home Assistant Core",
-        "source_page": "https://github.com/home-assistant/operating-system/releases/download/[0-9].0.rc[0-9]/",
-        "pattern": "haos_ova-[0-9].0.rc[0-9].qcow2.xz"
+        "os": "Home Assistant OS",
+        "version": "16.3",
+        "source_page": "https://github.com/home-assistant/operating-system/releases/download/",
+        "pattern": "haos_ova-${version}.qcow2.xz"
     }
 ]

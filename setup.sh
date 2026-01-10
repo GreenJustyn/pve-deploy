@@ -1,7 +1,7 @@
 #!/bin/bash
 # -----------------------------------------------------------------------------
-# Script: setup.sh (v9.2 - Stderr Logging Fix)
-# Description: Fixes "VMID VMID" bug by moving console logs to stderr.
+# Script: setup.sh (v10.1 - The "All-in-One" Release)
+# Description: Includes Central Logging (Fixed), Cloning Support, and ISO Variables.
 # -----------------------------------------------------------------------------
 
 set -euo pipefail
@@ -14,7 +14,7 @@ SVC_HOST_UP="proxmox-autoupdate"
 SVC_LXC_UP="proxmox-lxc-autoupdate"
 SVC_ISO="proxmox-iso-sync"
 
-echo ">>> Starting Proxmox Installation (v9.2)..."
+echo ">>> Starting Proxmox Installation (v10.1)..."
 
 # 1. Dependency Check
 apt-get update -qq
@@ -31,8 +31,8 @@ pkill -9 -f "proxmox_lxc_autoupdate.sh" || true
 pkill -9 -f "proxmox_iso_sync.sh" || true
 rm -f /tmp/proxmox_dsc.lock
 
-# --- PART A: Central Logging Library (FIXED) ---
-echo "--- Installing Common Library (v9.2) ---"
+# --- PART A: Central Logging Library (v9.2 Fix) ---
+echo "--- Installing Common Library (v9.2 Stderr Fix) ---"
 cat <<'EOF' > "$INSTALL_DIR/common.lib"
 # Proxmox IaC Common Library
 MASTER_LOG="/var/log/proxmox_master.log"
@@ -51,8 +51,7 @@ log() {
     # 2. Write to Local Log
     if [[ -n "${LOG_FILE:-}" ]]; then echo "$local_line" >> "$LOG_FILE"; fi
 
-    # 3. Output to Stderr (CRITICAL FIX)
-    # This prevents logs from being captured by $(...) variable substitution
+    # 3. Output to Stderr (CRITICAL FIX: Prevents variable capture pollution)
     echo "$log_line" >&2
 }
 
@@ -100,10 +99,8 @@ apply_and_restart() {
 }
 EOF
 
-# --- PART B: Core DSC Engine (v9.2) ---
-# No logic changes needed here, as the fix is in common.lib's log() function.
-# We re-write it simply to ensure the file is consistent.
-echo "--- Installing Core DSC Engine ---"
+# --- PART B: Core DSC Engine (v10.0 Cloning Logic) ---
+echo "--- Installing Core DSC Engine (v10.0 Cloning Support) ---"
 cat <<'EOF' > "$INSTALL_DIR/proxmox_dsc.sh"
 #!/bin/bash
 source /root/iac/common.lib
@@ -146,6 +143,8 @@ reconcile_cloudinit() {
         local ci_ip=$(echo "$config" | jq -r ".cloud_init.ipconfig0")
         local cur_ide2=$(safe_exec qm config "$vmid" | grep "ide2:")
         local update_ci_settings=false
+        
+        # Check for Missing Drive OR Wrong Media (ISO in CloudInit slot)
         if [[ -z "$cur_ide2" ]] || (echo "$cur_ide2" | grep -q "media=cdrom" && echo "$cur_ide2" | grep -q "\.iso"); then
              log "WARN" "Drift $vmid: Cloud-Init drive missing or holding ISO. Fixing..."
              if [[ "$DRY_RUN" == "false" ]]; then
@@ -214,7 +213,7 @@ reconcile_vm() {
     local config="$1"
     local vmid=$(echo "$config" | jq -r '.vmid')
     local hostname=$(echo "$config" | jq -r '.hostname')
-    local iso=$(echo "$config" | jq -r '.template')
+    local template=$(echo "$config" | jq -r '.template') # Can be ISO path OR Template ID
     local memory=$(echo "$config" | jq -r '.memory')
     local cores=$(echo "$config" | jq -r '.cores')
     local sockets=$(echo "$config" | jq -r '.sockets // 1')
@@ -229,12 +228,21 @@ reconcile_vm() {
     local status=$(get_resource_status "$vmid")
 
     if [[ "$status" == "missing" ]]; then
-        log "WARN" "VM $vmid missing. Creating..."
+        log "WARN" "VM $vmid missing. Provisioning..."
         if [[ "$DRY_RUN" == "false" ]]; then
-            if safe_exec qm create "$vmid" --name "$hostname" --memory "$memory" --cores "$cores" --sockets "$sockets" --cpu "$cpu_type" --net0 "$net0" --scsi0 "$storage" --cdrom "$iso" --scsihw virtio-scsi-pci --boot order=scsi0;ide2;net0 --onboot "$onboot" --protection "$protection"; then
-                if [[ $(echo "$config" | jq -r '.cloud_init.enable') == "true" ]]; then reconcile_cloudinit "$vmid" "$config" "$storage"; fi
-                log "SUCCESS" "VM $vmid created."
+            # v10.0 CLONING SUPPORT
+            if [[ "$template" =~ ^[0-9]+$ ]]; then
+                log "ACTION" "Cloning from Template ID $template..."
+                local store_target=$(echo "$storage" | awk -F: '{print $1}')
+                safe_exec qm clone "$template" "$vmid" --name "$hostname" --full 1 --storage "$store_target"
+                safe_exec qm set "$vmid" --memory "$memory" --cores "$cores" --sockets "$sockets" --cpu "$cpu_type" --net0 "$net0" --onboot "$onboot" --protection "$protection"
+            else
+                log "ACTION" "Creating Blank VM from ISO..."
+                safe_exec qm create "$vmid" --name "$hostname" --memory "$memory" --cores "$cores" --sockets "$sockets" --cpu "$cpu_type" --net0 "$net0" --scsi0 "$storage" --cdrom "$template" --scsihw virtio-scsi-pci --boot order=scsi0;ide2;net0 --onboot "$onboot" --protection "$protection"
             fi
+            
+            if [[ $(echo "$config" | jq -r '.cloud_init.enable') == "true" ]]; then reconcile_cloudinit "$vmid" "$config" "$storage"; fi
+            log "SUCCESS" "VM $vmid provisioned."
         fi
     elif [[ "$status" == "exists_lxc" ]]; then
         log "ERROR" "ID Conflict: $vmid is VM but exists as LXC."
@@ -248,6 +256,17 @@ reconcile_vm() {
         if [[ "${cur_cpu:-kvm64}" != "$cpu_type" ]]; then log "WARN" "Drift $vmid: CPU Type ${cur_cpu:-kvm64} -> $cpu_type"; [[ "$DRY_RUN" == "false" ]] && apply_and_restart "$vmid" "vm" qm "set --cpu $cpu_type"; fi
         local cur_net0=$(safe_exec qm config "$vmid" | grep "net0:" | awk '{$1=""; print $0}' | xargs)
         if [[ "$cur_net0" != "$net0" ]]; then log "INFO" "Drift $vmid: Network Config Changed."; [[ "$DRY_RUN" == "false" ]] && apply_and_restart "$vmid" "vm" qm "set --net0 $net0"; fi
+        
+        # v10.0 DISK RESIZE
+        local req_size=$(echo "$storage" | awk -F: '{print $2}')
+        local cur_size_raw=$(safe_exec qm config "$vmid" | grep "scsi0:" | grep -o "size=[0-9]*G" | grep -o "[0-9]*")
+        if [[ -n "$req_size" && -n "$cur_size_raw" ]]; then
+            if (( req_size > cur_size_raw )); then
+                log "WARN" "Drift $vmid: Disk Size ${cur_size_raw}G -> ${req_size}G. Resizing..."
+                [[ "$DRY_RUN" == "false" ]] && safe_exec qm resize "$vmid" scsi0 "${req_size}G"
+            fi
+        fi
+
         reconcile_cloudinit "$vmid" "$config" "$storage"
     fi
 
@@ -298,8 +317,72 @@ log "INFO" "Run complete."
 EOF
 chmod +x "$INSTALL_DIR/proxmox_dsc.sh"
 
-# --- PART C: Install & Patch Other Scripts ---
-echo "--- Patching & Installing Auxiliary Scripts ---"
+# --- PART C: ISO Sync Script (v10.1 Variable Support) ---
+echo "--- Installing ISO Sync Script (v10.1 Variables) ---"
+cat <<'EOF' > "$INSTALL_DIR/proxmox_iso_sync.sh"
+#!/bin/bash
+source /root/iac/common.lib
+LOG_FILE="/var/log/proxmox_iso_sync.log"
+MANIFEST="/root/iac/iso-images.json"
+STORAGE_ID="local"
+
+if ! command -v jq &> /dev/null; then log "ERROR" "jq missing."; exit 1; fi
+if [ ! -f "$MANIFEST" ]; then log "ERROR" "Manifest missing."; exit 1; fi
+
+STORAGE_PATH=$(safe_exec pvesm path "$STORAGE_ID:iso" 2>/dev/null | xargs dirname 2>/dev/null)
+if [ -z "$STORAGE_PATH" ] || [ "$STORAGE_PATH" == "." ]; then STORAGE_PATH="/var/lib/vz/template/iso"; fi
+if [ ! -d "$STORAGE_PATH" ]; then log "ERROR" "Path $STORAGE_PATH not found."; exit 1; fi
+
+log "INFO" "Syncing ISOs to $STORAGE_PATH..."
+declare -a KEPT_FILES=()
+COUNT=$(jq '. | length' "$MANIFEST")
+
+for ((i=0; i<$COUNT; i++)); do
+    OS=$(jq -r ".[$i].os" "$MANIFEST")
+    PAGE=$(jq -r ".[$i].source_page" "$MANIFEST")
+    PATTERN=$(jq -r ".[$i].pattern" "$MANIFEST")
+    VERSION=$(jq -r ".[$i].version // empty" "$MANIFEST")
+
+    if [[ -n "$VERSION" ]]; then
+        # v10.1 Variable Mode
+        LATEST_FILE="${PATTERN//\$\{version\}/$VERSION}"
+        if [[ "$PAGE" == *"github.com"* && "$PAGE" == *"download/" ]]; then DOWNLOAD_URL="${PAGE}${VERSION}/${LATEST_FILE}"; else DOWNLOAD_URL="${PAGE}${LATEST_FILE}"; fi
+        log "CHECKING: $OS (Pinned: $VERSION)..."
+    else
+        # Dynamic Scraper Mode
+        log "CHECKING: $OS (Scraping: $PATTERN)..."
+        LATEST_FILE=$(curl -sL "$PAGE" | grep -oP "$PATTERN" | sort -V | tail -n 1)
+        if [ -z "$LATEST_FILE" ]; then log "WARN" "Could not scrape file for $OS"; continue; fi
+        if [[ "$PAGE" == */ ]]; then DOWNLOAD_URL="${PAGE}${LATEST_FILE}"; else DOWNLOAD_URL="${PAGE}/${LATEST_FILE}"; fi
+    fi
+
+    TARGET_FILE="$STORAGE_PATH/$LATEST_FILE"
+    KEPT_FILES+=("$LATEST_FILE")
+    if [ -f "$TARGET_FILE" ]; then
+        log "OK: $LATEST_FILE exists."
+    else
+        log "NEW: $LATEST_FILE found."
+        log "ACTION" "Downloading $DOWNLOAD_URL..."
+        if safe_exec wget -q --show-progress -O "${TARGET_FILE}.tmp" "$DOWNLOAD_URL"; then
+            mv "${TARGET_FILE}.tmp" "$TARGET_FILE"
+            log "SUCCESS" "Downloaded $LATEST_FILE"
+        else
+            log "ERROR" "Download failed for $LATEST_FILE"
+            rm -f "${TARGET_FILE}.tmp"
+        fi
+    fi
+done
+
+EXISTING_FILES=$(ls "$STORAGE_PATH"/*.iso "$STORAGE_PATH"/*.qcow2 "$STORAGE_PATH"/*.xz 2>/dev/null | xargs -n 1 basename)
+for file in $EXISTING_FILES; do
+    is_kept=false
+    for kept in "${KEPT_FILES[@]}"; do if [[ "$file" == "$kept" ]]; then is_kept=true; break; fi; done
+    if [ "$is_kept" == "false" ]; then log "DELETE" "Obsolete file: $file"; rm -f "$STORAGE_PATH/$file"; fi
+done
+EOF
+chmod +x "$INSTALL_DIR/proxmox_iso_sync.sh"
+
+# --- PART D: Patching & Installing Auxiliary Scripts ---
 install_and_patch() {
     local filename=$1
     if [ -f "$filename" ]; then
@@ -312,12 +395,11 @@ install_and_patch() {
 }
 install_and_patch "proxmox_autoupdate.sh"
 install_and_patch "proxmox_lxc_autoupdate.sh"
-install_and_patch "proxmox_iso_sync.sh"
 
 if [ -f "state.json" ]; then cp state.json "$INSTALL_DIR/state.json"; else echo "[]" > "$INSTALL_DIR/state.json"; fi
 if [ -f "iso-images.json" ]; then cp iso-images.json "$INSTALL_DIR/iso-images.json"; else echo "[]" > "$INSTALL_DIR/iso-images.json"; fi
 
-# --- PART D: Wrapper ---
+# --- PART E: Wrapper ---
 cat <<EOF > "$INSTALL_DIR/proxmox_wrapper.sh"
 #!/bin/bash
 source /root/iac/common.lib
@@ -370,7 +452,7 @@ log "INFO" "Deploying..."
 EOF
 chmod +x "$INSTALL_DIR/proxmox_wrapper.sh"
 
-# --- PART E: Log Rotation & Units ---
+# --- PART F: Log Rotation & Units ---
 cat <<EOF > /etc/logrotate.d/proxmox_iac
 /var/log/proxmox_master.log
 /var/log/proxmox_dsc.log 
@@ -394,5 +476,5 @@ systemctl enable --now ${SVC_HOST_UP}.timer
 systemctl enable --now ${SVC_LXC_UP}.timer
 systemctl enable --now ${SVC_ISO}.timer
 
-echo ">>> Installation Complete (v9.2)."
-echo "    FIXED: Console logging moved to stderr to prevent variable capture pollution."
+echo ">>> Installation Complete (v10.1)."
+echo "    FEATURES: Central Logging (Stderr Fix), Cloning/Resize, ISO Variables."
